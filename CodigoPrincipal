@@ -1,0 +1,240 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// === CONFIGURAÇÕES ===
+#define ID "10-3"
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define LED_PIN 2
+#define INTERVALO_MIN_MS 45000
+#define INTERVALO_MAX_MS 75000
+
+// === HISTÓRICO ANTI-LOOP ===
+#define HISTORICO_MAX 10
+
+struct PacoteVisto {
+  String id;
+  int contador;
+};
+
+PacoteVisto historico[HISTORICO_MAX];
+int historicoIndex = 0;
+
+bool jaVisto(const String& id, int contador) {
+  for (int i = 0; i < HISTORICO_MAX; i++) {
+    if (historico[i].id == id && historico[i].contador == contador) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void salvarNoHistorico(const String& id, int contador) {
+  historico[historicoIndex] = { id, contador };
+  historicoIndex = (historicoIndex + 1) % HISTORICO_MAX;
+}
+
+// === VARIÁVEIS GLOBAIS ===
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+unsigned long ultimoEnvio = 0;
+unsigned long intervaloAtual = 60000;
+int contadorMensagens = 0;
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// === FUNÇÕES AUXILIARES ===
+void piscarLED(int tempo = 50) {
+  digitalWrite(LED_PIN, HIGH);
+  delay(tempo);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void enviarJSON(const String& json, bool piscarLongo = false) {
+  esp_now_send(broadcastAddress, (uint8_t*)json.c_str(), json.length() + 1);
+  piscarLED(piscarLongo ? 300 : 50);
+}
+
+unsigned long sortearIntervalo() {
+  return random(INTERVALO_MIN_MS, INTERVALO_MAX_MS);
+}
+
+// ACK enviado diretamente para o MAC de quem mandou (evita broadcast storm)
+void enviarACK(const String& idDestino, const uint8_t* macDestino) {
+  StaticJsonDocument<100> ack;
+  ack["tipo"] = "ACK";
+  ack["de"]   = ID;
+  ack["para"] = idDestino;
+
+  String json;
+  serializeJson(ack, json);
+
+  // Cadastra o peer se ainda não estiver na lista
+  if (!esp_now_is_peer_exist(macDestino)) {
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, macDestino, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+  }
+
+  Serial.print("📨 Enviando ACK para: ");
+  Serial.println(idDestino);
+
+  // Envia só para quem mandou, não para toda a rede
+  esp_now_send(macDestino, (uint8_t*)json.c_str(), json.length() + 1);
+}
+
+void montarEEnviarInternos() {
+  float temperatura = dht.readTemperature();
+  float umidade = dht.readHumidity();
+
+  if (isnan(temperatura) || isnan(umidade)) {
+    Serial.println("⚠️ Erro ao ler o sensor DHT!");
+    return;
+  }
+
+  StaticJsonDocument<200> doc;
+  doc["tipo"]        = "dados";
+  doc["id"]          = ID;
+  doc["contador"]    = ++contadorMensagens;
+  doc["temperatura"] = (int)temperatura;
+  doc["umidade"]     = (int)umidade;
+
+  String json;
+  serializeJson(doc, json);
+
+  Serial.print("📤 Enviando: ");
+  Serial.println(json);
+
+  salvarNoHistorico(ID, contadorMensagens);
+  enviarJSON(json, true);
+
+  intervaloAtual = sortearIntervalo();
+  Serial.print("⏱ Próximo envio em: ");
+  Serial.print(intervaloAtual / 1000);
+  Serial.println("s");
+}
+
+// === CALLBACKS ===
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("Status envio: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ OK" : "❌ Falhou");
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  String json = String((char*)incomingData);
+
+  StaticJsonDocument<200> doc;
+  DeserializationError erro = deserializeJson(doc, json);
+
+  if (erro) {
+    Serial.println("⚠️ JSON inválido, ignorando...");
+    return;
+  }
+
+  String tipo = doc["tipo"] | "dados";
+
+  // === Se for ACK ===
+  if (tipo == "ACK") {
+    String de   = doc["de"].as<String>();
+    String para = doc["para"].as<String>();
+    if (para == ID) {
+      Serial.print("✅ ACK recebido de: ");
+      Serial.println(de);
+    }
+    return;
+  }
+
+  // === Se for dados ===
+  String idRecebido = doc["id"].as<String>();
+  int contador      = doc["contador"];
+  int temperatura   = doc["temperatura"];
+  int umidade       = doc["umidade"];
+
+  if (idRecebido == ID) return;
+
+  if (jaVisto(idRecebido, contador)) {
+    Serial.println("🔁 Pacote duplicado, ignorando...");
+    return;
+  }
+
+  salvarNoHistorico(idRecebido, contador);
+
+  Serial.println("--- Dados Recebidos ---");
+  Serial.print("ID: ");          Serial.println(idRecebido);
+  Serial.print("Temperatura: "); Serial.println(temperatura);
+  Serial.print("Umidade: ");     Serial.println(umidade);
+  Serial.print("Contador: ");    Serial.println(contador);
+  Serial.println("------------------------\n");
+
+  // ACK direto para o MAC de quem enviou
+  enviarACK(idRecebido, info->src_addr);
+
+  // Repassa para a rede com delay aleatório pequeno
+  delay(random(10, 100));
+  enviarJSON(json, false);
+}
+
+// === SETUP ===
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  dht.begin();
+
+  for (int i = 0; i < HISTORICO_MAX; i++) {
+    historico[i] = { "", -1 };
+  }
+
+  for (int i = 0; i < 3; i++) {
+    piscarLED(200);
+    delay(200);
+  }
+
+  WiFi.mode(WIFI_STA);
+  randomSeed(esp_random());
+
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ Erro ao iniciar ESP-NOW");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("❌ Erro ao adicionar peer");
+    return;
+  }
+
+  intervaloAtual = sortearIntervalo();
+  Serial.println("✅ ESP-NOW iniciado!");
+  Serial.print("⏱ Primeiro envio em: ");
+  Serial.print(intervaloAtual / 1000);
+  Serial.println("s");
+
+  ultimoEnvio = millis();
+}
+
+// === LOOP ===
+void loop() {
+  unsigned long agora = millis();
+
+  if (agora - ultimoEnvio >= intervaloAtual) {
+    montarEEnviarInternos();
+    ultimoEnvio = agora;
+  }
+
+  delay(100);
+}
