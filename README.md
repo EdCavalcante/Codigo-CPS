@@ -1,4 +1,4 @@
-# 🌡️ Rede IoT com ESP-NOW — Monitoramento Ambiental Distribuído
+# 🌡️ Rede IoT com ESP-NOW. Um Monitoramento Distribuído
 
 > Projeto desenvolvido para a disciplina de **Sistemas Ciberfísicos Colaborativos**  
 > **Universidade de Fortaleza (UNIFOR)** — Centro de Ciências Tecnológicas  
