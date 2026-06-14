@@ -1,0 +1,255 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// configuracoes
+#define ID "10-3"
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define LED_PIN 2
+#define UART_RX 16
+#define UART_TX 17
+#define UART_BAUD 115200
+#define INTERVALO_MIN_MS 10000
+#define INTERVALO_MAX_MS 8000
+
+//para ver se essa mensagem já foi recebida, aqui armazena os ids
+#define HISTORICO_MAX 10
+
+struct PacoteVisto {
+  String id;
+  int contador;
+};
+
+PacoteVisto historico[HISTORICO_MAX];
+int historicoIndex = 0;
+
+bool jaVisto(const String& id, int contador) {
+  for (int i = 0; i < HISTORICO_MAX; i++) { //percorre o historico, vendo se ja existe id e o contador
+    if (historico[i].id == id && historico[i].contador == contador) {
+      return true; //ja foi recebida
+    }
+  }
+  return false;
+}
+
+void salvarNoHistorico(const String& id, int contador) {
+  historico[historicoIndex] = { id, contador };
+  historicoIndex = (historicoIndex + 1) % HISTORICO_MAX;
+}
+
+//variaveis gerais
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+unsigned long ultimoEnvio = 0;
+unsigned long intervaloAtual = 60000;
+int contadorMensagens = 0;
+
+DHT dht(DHTPIN, DHTTYPE);
+
+// piscar o led ao realizar uma ação
+void piscarLED(int tempo = 50) {
+  digitalWrite(LED_PIN, HIGH);
+  delay(tempo);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void enviarJSON(const String& json, bool piscarLongo = false) {
+  esp_now_send(broadcastAddress, (uint8_t*)json.c_str(), json.length() + 1);
+  piscarLED(piscarLongo ? 300 : 50);
+}
+
+unsigned long sortearIntervalo() {
+  return random(INTERVALO_MIN_MS, INTERVALO_MAX_MS);
+}
+
+// confirmacao de que a mensagem chegou ACK
+void enviarACK(const String& idDestino, const uint8_t* macDestino) {
+  StaticJsonDocument<100> ack;
+  ack["tipo"] = "ACK";
+  ack["de"]   = ID;
+  ack["para"] = idDestino;
+
+  String json;
+  serializeJson(ack, json);
+
+  // Cadastra o esp do lado se ainda não estiver na lista
+  if (!esp_now_is_peer_exist(macDestino)) {
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, macDestino, 6);
+    peer.channel = 0;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+  }
+
+  Serial.print(" 10-3 Enviando ACK para: ");
+  Serial.println(idDestino);
+
+  // envia só para quem mandou, não para toda a rede
+  esp_now_send(macDestino, (uint8_t*)json.c_str(), json.length() + 1);
+}
+
+void montarEEnviarInternos() {
+  float temperatura = dht.readTemperature();
+  float umidade = dht.readHumidity();
+
+  if (isnan(temperatura) || isnan(umidade)) {
+    Serial.println(" Erro ao ler o sensor DHT! Verifique a montagem");
+    return;
+  }
+
+  StaticJsonDocument<200> doc;
+  doc["tipo"]        = "dados";
+  doc["id"]          = ID;
+  doc["contador"]    = ++contadorMensagens;
+  doc["temperatura"] = (int)temperatura;
+  doc["umidade"]     = (int)umidade;
+
+  String json;
+  serializeJson(doc, json);
+
+  Serial.print(" Enviando: ");
+  Serial.println(json);
+
+  // envia para o ESP2 pela UART
+  Serial2.println(json);
+  Serial.println("UART enviada!");
+
+
+  salvarNoHistorico(ID, contadorMensagens);
+  enviarJSON(json, true);
+
+  intervaloAtual = sortearIntervalo();
+  Serial.print("⏱ Próximo envio em: ");
+  Serial.print(intervaloAtual / 1000);
+  Serial.println("s");
+}
+
+
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.print("Status envio: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ OK" : " Falhou");
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  String json = String((char*)incomingData);
+
+  StaticJsonDocument<200> doc;
+  DeserializationError erro = deserializeJson(doc, json);
+
+  if (erro) {
+    Serial.println(" JSON inválido, ignorando..");
+    return;
+  }
+
+  String tipo = doc["tipo"] | "dados";
+
+  // ACK
+  if (tipo == "ACK") {
+    String de   = doc["de"].as<String>();
+    String para = doc["para"].as<String>();
+    if (para == ID) {
+      Serial.print("Recebido de: ");
+      Serial.println(de);
+    }
+    return;
+  }
+
+  //se for dados
+  String idRecebido = doc["id"].as<String>();
+  int contador      = doc["contador"];
+  int temperatura   = doc["temperatura"];
+  int umidade       = doc["umidade"];
+
+  if (idRecebido == ID) return;
+
+  if (jaVisto(idRecebido, contador)) {
+    Serial.println(" Mensagem duplicada, ignorando! ");
+    return;
+  }
+
+  salvarNoHistorico(idRecebido, contador);
+  
+//recebeu dados e agora aparece no serial monitor nesse padrao
+  Serial.println("--- Dados Recebidos ---");
+  Serial.print("ID: ");          Serial.println(idRecebido);
+  Serial.print("Temperatura: "); Serial.println(temperatura);
+  Serial.print("Umidade: ");     Serial.println(umidade);
+  Serial.print("Contador: ");    Serial.println(contador);
+  Serial.println("------------------------\n");
+
+  Serial2.println(json);
+
+  Serial.println("Repassado para Esp2");
+  
+  // ACK direto para o MAC de quem enviou
+  enviarACK(idRecebido, info->src_addr);
+
+ 
+  delay(random(10, 100));
+  enviarJSON(json, false);
+}
+
+//setup do codigo
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+
+  pinMode(LED_PIN, OUTPUT);
+  dht.begin();
+
+  for (int i = 0; i < HISTORICO_MAX; i++) {
+    historico[i] = { "", -1 };
+  }
+
+  for (int i = 0; i < 3; i++) {
+    piscarLED(200);
+    delay(200);
+  }
+
+  WiFi.mode(WIFI_STA);
+  randomSeed(esp_random());
+
+  Serial.print("MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Erro ao iniciar");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Erro ao adicionar");
+    return;
+  }
+
+  intervaloAtual = sortearIntervalo();
+  Serial.println("✅ ESP-NOW iniciado!");
+  Serial.print(" Primeiro envio será em: ");
+  Serial.print(intervaloAtual / 1000);
+  Serial.println("s");
+
+  ultimoEnvio = millis();
+}
+
+//loop de envio para gerenciar o tempo de envio dos dados
+void loop() {
+  unsigned long agora = millis();
+
+  if (agora - ultimoEnvio >= intervaloAtual) {
+    montarEEnviarInternos();
+    ultimoEnvio = agora;
+  }
+
+  delay(100);
+}
