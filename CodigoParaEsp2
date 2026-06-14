@@ -1,0 +1,86 @@
+#include "AdafruitIO_WiFi.h"
+#include <ArduinoJson.h>
+
+#define UART_RX 16
+#define UART_TX 17
+#define UART_BAUD 115200
+
+// ===== Adafruit IO =====
+#define IO_USERNAME "userdavi"
+#define IO_KEY      COLOCA SENHA AQUI!!!!!!!!
+
+#define WIFI_SSID   "Babau"
+#define WIFI_PASS   "12345678"
+
+AdafruitIO_WiFi io(
+  IO_USERNAME,
+  IO_KEY,
+  WIFI_SSID,
+  WIFI_PASS
+);
+
+// Feeds
+AdafruitIO_Feed *temperaturaFeed = io.feed("temperatura");
+AdafruitIO_Feed *umidadeFeed     = io.feed("umidade");
+
+void setup() {
+
+  Serial.begin(115200);
+
+  Serial2.begin(
+    UART_BAUD,
+    SERIAL_8N1,
+    UART_RX,
+    UART_TX
+  );
+
+  Serial.println("Conectando ao Adafruit IO...");
+
+  io.connect();
+
+  while (io.status() < AIO_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println();
+  Serial.println("Conectado ao Adafruit IO!");
+  Serial.println("Aguardando dados do ESP1...");
+}
+
+void loop() {
+
+  io.run();
+
+  if (Serial2.available()) {
+
+    String json = Serial2.readStringUntil('\n');
+
+    Serial.println("\nJSON recebido:");
+    Serial.println(json);
+
+    StaticJsonDocument<200> doc;
+
+    DeserializationError erro =
+      deserializeJson(doc, json);
+
+    if (erro) {
+      Serial.println("Erro ao ler JSON");
+      return;
+    }
+
+    int temperatura = doc["temperatura"];
+    int umidade     = doc["umidade"];
+
+    Serial.print("Temperatura: ");
+    Serial.println(temperatura);
+
+    Serial.print("Umidade: ");
+    Serial.println(umidade);
+
+    temperaturaFeed->save(temperatura);
+    umidadeFeed->save(umidade);
+
+    Serial.println("Dados enviados ao Adafruit IO!");
+  }
+}
